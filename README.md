@@ -13,7 +13,14 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented (branch `Dev/STM32H5`).** External tamper trigger/filter/precharge
+> configuration, the pin tables, internal tamper enable, reaction (mode, timestamp), status read/clear,
+> config lock and the backup registers with their protected areas are implemented and unit tested on
+> all 12 STM32H5 lines. Integration tests run on NUCLEO-H563ZI, NUCLEO-H503RB and NUCLEO-H533RE. Not
+> implemented yet: the active tamper pattern generator (multi-pair output sharing), per-scope erase
+> selection narrower than the hardware default, and RTC/TrustZone forwarding - see Tamp.c for the
+> exact list. The module enables the backup domain write access itself through the Pwr module
+> (`Pwr_Set_BackupAccessActive`) in `Tamp_Init`.
 
 ---
 
@@ -46,12 +53,13 @@ The module keeps three things apart:
 | Item | Meaning |
 |---|---|
 | **Tamper inputs** | External: `TAMP_EXT_1` ... (the pins of the device) with the trigger (`TAMP_TRIGGER_RISING` / `FALLING` / `LOW_LEVEL` / `HIGH_LEVEL`), the digital filter (the number of samples and the sampling frequency) and the pull-up precharge; active tampers with the output pin for each input. Internal: `TAMP_INT_*` (the temperature, the voltage and the clock monitors, the RTC / crypto faults, the backup domain voltage) - only the ones of the device. |
-| **Reaction** | For every tamper: `TAMP_MODE_CONFIRMED` (hardware erase of the secrets), `TAMP_MODE_POTENTIAL` (flag and interrupt only), whether it makes a timestamp in the RTC, whether it wakes the MCU, and the erase scope (`TAMP_ERASE_BACKUP_REGS`, `_BACKUP_SRAM`, `_SRAM2`, `_CACHES`, `_CRYPTO`). |
+| **Reaction** | For every tamper: `TAMP_MODE_CONFIRMED` (hardware erase of the secrets), `TAMP_MODE_POTENTIAL` (flag and interrupt only), `TAMP_MODE_DISABLED` (internal tampers only: not enabled, the default), whether it makes a timestamp in the RTC, whether it wakes the MCU, and the erase scope (`TAMP_ERASE_BACKUP_REGS`, `_BACKUP_SRAM`, `_SRAM2`, `_CACHES`, `_CRYPTO`). |
 | **Backup registers** | `Tamp_Get_BackupRegisterCount`, `Tamp_Set_BackupRegister`, `Tamp_Get_BackupRegister` - and the protected areas: a read / write secure area, a write secure / read non-secure area and a non-secure area, configured by the size of the areas. |
 
 Rules:
 
-1. `Tamp_Init` configures the inputs, the filters, the reaction and the interrupt. The configuration of a tamper input that is
+1. `Tamp_Init` requests the write access to the backup domain from the Pwr module (an error of the Pwr module deinitializes the
+   module and returns an error) and configures the inputs, the filters, the reaction and the interrupt. The configuration of a tamper input that is
    **already enabled** is rejected (the hardware rule); the configuration may be locked until the reset by `Tamp_Set_ConfigLock`.
 2. After a **confirmed** tamper the registers of the secrets are erased by the hardware, the module reads the event with
    `Tamp_Get_TamperStatus` (a bit mask of the events that happened, also while the MCU was in Standby) and clears it with
@@ -72,7 +80,7 @@ master.
 
 | Family | Branch | Peripheral | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `TAMP`: 32 backup registers in three protected areas, up to 8 external tamper events on up to 11 pins (passive and active, from 5 to 8 meshes), 13 internal tampers, confirmed and potential mode, erase of the backup registers, the backup SRAM, the SRAM2, the caches and the crypto peripherals, the timestamp, TrustZone | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `TAMP`: 32 backup registers in three protected areas, up to 8 external tamper events on up to 11 pins (passive and active, from 5 to 8 meshes), 13 internal tampers, confirmed and potential mode, erase of the backup registers, the backup SRAM, the SRAM2, the caches and the crypto peripherals, the timestamp, TrustZone | implemented, unit tested on 12 lines, integration tests run on NUCLEO-H563ZI, NUCLEO-H503RB and NUCLEO-H533RE |
 | STM32U5 | `Dev/STM32U5` | `TAMP` of the same generation | planned |
 | STM32U3 | `Dev/STM32U3` | `TAMP` | planned |
 | STM32G4, STM32L4 | `Dev/STM32G4`, `Dev/STM32L4` | the tamper pins and the backup registers are a part of the `RTC` (the functions are provided by the Rtc module and the module forwards to them) | planned |
@@ -179,6 +187,25 @@ else
 
 ## Behaviour and limits
 
+- **Backup domain write access.** `Tamp_Init` takes one reference of the access through `Pwr_Set_BackupAccessActive` and
+  holds it while the module is initialized; a repeated `Tamp_Init` does not take a second one. `Tamp_Deinit` releases it
+  through `Pwr_Set_BackupAccessInactive`. `Tamp_Set_BackupRegister`, `Tamp_Set_BackupAreas` and `Tamp_Set_TamperStatusClear`
+  work also without `Tamp_Init`: when the module does not hold the access they take a reference only for the duration of the
+  write. The access of the Pwr module is reference counted, so the reference of the Tamp module and the one of the Rtc module do
+  not cancel each other; the protection is enabled again when the last holder releases it. The Rcc module writes the same bit
+  by itself (the LSE), which the Pwr module accepts by design.
+- **Register interface clock.** The TAMP registers (also the backup registers) need the register interface clock
+  (`RCC_APB3ENR.RTCAPBEN`), without it they read as zero and ignore the writes. The module requests it from the Rcc module
+  with `Rcc_Set_PeriphActive( RCC_PERIPH_RTC_APB )` (the identifier enables the interface clock alone, no RTC clock selection)
+  in `Tamp_Init`, in the setters that work without `Tamp_Init`, and in `Tamp_Get_BackupRegister` / `Tamp_Get_TamperStatus`
+  of a module that is not initialized (a value kept over a reset is readable). The module never disables the clock: it is shared
+  with the Rtc module and the backup registers must stay accessible.
+- **Internal tampers.** The default configuration (`Tamp_Get_DefaultConfig`) leaves every internal tamper disabled
+  (`TAMP_MODE_DISABLED`): an enabled tamper with a pending flag blocks the backup registers and the SRAM2 (read as zero, writes
+  ignored) until the flag is cleared, for example the debug access tamper while a probe is attached. `TAMP_MODE_POTENTIAL`
+  enables the tamper without the erase, `TAMP_MODE_CONFIRMED` with the erase of the secrets.
+- **Tamper pins.** `Tamp_InitInputGpio` / `Tamp_InitOutputGpio` configure the pin in the analog mode through `Gpio_Init`
+  (it also enables the clock of the GPIO port).
 - **Erase is destructive.** A confirmed tamper erases the backup registers: do not keep the data that must survive a tamper there.
 - **Battery.** The tamper watch works from the battery in the backup domain; the passive inputs are ultra-low-power, the active
   mode consumes more.
